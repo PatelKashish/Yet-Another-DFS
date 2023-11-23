@@ -1,0 +1,115 @@
+
+'''
+def create_namenode_checkpoints():
+    current_time = datetime.datetime.now(IST)
+    checkpoint_name = f"CHECKPOINT_{current_time}"
+    checkpoint_path = Path(
+        args.NAMENODE_CHECKPOINTS_PATH).joinpath(checkpoint_name)
+    checkpoint_path.mkdir(parents=True)
+
+    primary_namenode_path = Path(
+        args.PATH_TO_NAMENODES).joinpath(args.PRIMARY_NAMENODE_NAME)
+    files_in_primary_namenode = primary_namenode_path.glob('**/*')
+    files_in_primary_namenode = list(
+        filter(Path.is_file, files_in_primary_namenode))
+
+    for filename in files_in_primary_namenode:
+        root_name = filename.name
+        destination_path = str(checkpoint_path.joinpath(root_name))
+        filename = str(filename)
+        shutil.copy(filename, destination_path)
+'''
+def run_mapper(mapper_filename, input_filename, index):
+    global SHARED_JOB_OUTPUT
+    output = os.popen(f'cat {input_filename} | python3 {mapper_filename}')
+    SHARED_JOB_OUTPUT.append((output.read().strip(), index))
+
+
+def aggregate_and_sort(outputs):
+    output = list()
+    for o in outputs:
+        output.extend(o[0].split('\n'))
+    output.sort()
+    return output
+
+
+def run_reducer(reducer_filename, outputs, output_dir_name):
+    command = f"echo -e '{outputs}' | python3 {reducer_filename}"
+    output = os.popen(command)
+
+    with open('output', 'w') as f:
+        f.write(output.read().strip())
+    with open('status', 'w') as f:
+        f.write("JOB COMPLETED SUCCESSFULLY")
+
+    mkdir(output_dir_name)
+    put('output', f"{output_dir_name}/output.txt")
+    put('status', f"{output_dir_name}/status.txt")
+    Path('output').unlink()
+    Path('status').unlink()
+
+
+    def run(*vargs):
+    global SHARED_JOB_OUTPUT
+    SHARED_JOB_OUTPUT[:] = []
+
+    run_parser = argparse.ArgumentParser()
+    run_parser.add_argument(
+        "--input", '-i', help="Input file path", type=str)
+    run_parser.add_argument(
+        "--output", '-o', help="Output directory path", type=str)
+    run_parser.add_argument(
+        "--mapper", '-m', help="Mapper file path", type=str)
+    run_parser.add_argument(
+        "--reducer", '-r', help="Reducer file path", type=str)
+    run_args = run_parser.parse_args(vargs)
+
+    input_file_path = run_args.input
+    output_dir_path = run_args.output
+    mapper_file_path = run_args.mapper
+    reducer_file_path = run_args.reducer
+
+    if not check_path_exists_in_hdfs(input_file_path):
+        print(f"Error: {input_file_path} not found")
+        return False
+    if not Path(mapper_file_path).exists():
+        print(f"Error: {mapper_file_path} not found")
+        return False
+    if not Path(reducer_file_path).exists():
+        print(f"Error: {reducer_file_path} not found")
+        return False
+    if check_path_exists_in_hdfs(output_dir_path):
+        print(f"Error: {output_dir_path} already present")
+        return False
+
+    file_id = get_file_id_from_hdfs_file_path(input_file_path)
+    if file_id is None:
+        print("Error: File not found.")
+        return False
+
+    num_blocks = args.FILE_INFO[file_id]['num_blocks']
+    block_id = [f"{file_id}__{bid}" for bid in range(1, num_blocks+1)]
+    block_paths = dict()
+    for block_id in block_id:
+        datanode_id = get_datanode_id_from_block_id(block_id)
+        block_paths[block_id] = Path(
+            args.PATH_TO_DATANODES).joinpath(datanode_id).joinpath(block_id)
+    if None in block_paths.values():
+        print("Error: Missing blocks or file not found.")
+        return False
+    else:
+        current_processes = list()
+        for process_index, block_path in enumerate(block_paths.values()):
+            current_process = Process(
+                target=run_mapper, args=(mapper_file_path, block_path, process_index))
+            current_process.start()
+            current_processes.append(current_process)
+
+        for current_process in current_processes:
+            current_process.join()
+        current_processes.clear()
+
+        output = sorted(SHARED_JOB_OUTPUT, key=lambda x: x[1])
+        output = '\n'.join(aggregate_and_sort(output))
+        run_reducer(reducer_file_path, output, output_dir_path)
+        return True
